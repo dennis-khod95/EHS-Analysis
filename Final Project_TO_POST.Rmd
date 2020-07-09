@@ -1,0 +1,401 @@
+---
+title: "Final Project"
+author: "Dennis Khodasevich"
+date: "5/5/2019"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction to the Assignment
+
+In this analysis, we will examine the cross-sectional relationship between exposure to triclosan, a common  antibacterial and antifungal agent found in many consumer products (e.g., soaps, detergents) and body mass index, based on the recent reports:
+
+http://www.ncbi.nlm.nih.gov/pubmed/25823951
+
+http://www.ncbi.nlm.nih.gov/pubmed/24278238
+
+
+## Step 1:  Download the data and load it in R
+https://wwwn.cdc.gov/nchs/nhanes/continuousnhanes/default.aspx?BeginYear=2003
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+library("tidyverse") 
+library("foreign")
+library("labelled")
+library("survey")
+library("fastDummies")
+library("jtools")
+
+Body <- read.xport("BMX_C.XPT")
+Cot <- read.xport("L06COT_C.XPT")
+Phenols <- read.xport("L24EPH_C.XPT")
+Demographics <- read.xport("DEMO_C.XPT")
+```
+
+Below, please find a list of files and the variables you will need from each file  
+
+#### Examination:  Body   
+BMXBMI (Body Mass Index)
+
+#### Lab06: Serum Cotinine 
+LBXCOT (cotinine)
+
+#### Lab24: Environmental Phenols  
+WTMEC2YR (2 year MEC weight)  
+SDMVPSU (primary sampling unit)  
+SDMVSTRA (sampling strata)  
+RIDAGEYR (age at screening)  
+RIAGENDR (gender)  
+RIDRETH1 (race/ethnicity)  
+INDFMPIR (family poverty income ratio)  
+URDTRS (urinary triclosan)  #Yes
+URDTRSLC (urinary triclosan comment)   #Yes
+URXUCR (creatinine); URXBPH (urinary BPA)  #Yes
+URDBPHLC (urinary BPA comment)  #Yes
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+#Body Dataset
+Body <- Body %>%
+  rename(BMI = BMXBMI)
+
+Body <- Body %>%
+  select(BMI, SEQN)
+
+#Cotinine Dataset
+Cot <- Cot %>%
+  rename(Cotinine = LBXCOT)
+
+#Phenol Dataset
+Phenols <- Phenols %>%
+  rename(Triclosan = URDTRS, TriComment = URDTRSLC, Creatinine = URXUCR, BPA = URXBPH, BPAComment = URDBPHLC)
+
+Phenols <- Phenols %>%
+  select(Triclosan, TriComment, Creatinine, BPA, BPAComment, SEQN)
+
+Phenols <- Phenols %>%
+  set_value_labels(TriComment = c("Above_LOD" = 0, "Below_LOD" = 1), BPAComment = c("Above_LOD" = 0, "Below_LOD" = 1))
+
+Phenols <- Phenols %>%
+  mutate_if(is.labelled, to_factor)
+
+#Demographics Dataset
+Demographics <- Demographics %>%
+  rename(Weight = WTMEC2YR, 
+         SampUnit = SDMVPSU, 
+         Strata = SDMVSTRA, 
+         Age = RIDAGEYR, 
+         Gender = RIAGENDR,
+         Race = RIDRETH1,
+         PovertyRatio = INDFMPIR)
+
+Demographics <- Demographics %>% 
+  select(Weight, SampUnit, Strata, Age, Gender, Race, PovertyRatio, SEQN)
+
+Demographics <- Demographics %>%
+  set_value_labels(Gender = c("Male" = 1, "Female" = 2), 
+                   Race = c("Mexican" = 1, "Other Hispanic" = 2, "NH_White" = 3, "NH_Black" = 4, "Other" = 5))
+
+Demographics <- Demographics %>%
+  mutate_if(is.labelled, to_factor)
+
+```
+
+
+## Step 2:  Merge  and prepare data
+
+#### A)	Merge the individual datasets  
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+Merged_BC <- full_join(Body, Cot, by = c("SEQN"))
+Merged_DP <- full_join(Demographics, Phenols, by = c("SEQN"))
+NHANES <- full_join(Merged_BC, Merged_DP, by = c("SEQN"))
+```
+
+#### B)	Keep the individuals who are not missing any of the variables 
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+NHANES <- na.omit(NHANES)
+```
+
+#### C)	Make sure all values are labeled and formats are correct
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+#Done in previous steps
+```
+
+#### D)	Create new variables for analysis
+
+**Adjust BPA and tricolose for creatinine (creatinine is a measure of urinary dilution)**  
+
+Triclosan (ng/mg  creatinine) = triclosan (ng/mL)/creatinine (mg/dL)
+
+BPA (ng/mg creatinine) = BPA (ng/mL)/creatinine (mg/dL)
+
+(reference:  http://www.ncbi.nlm.nih.gov/pubmed/18335095)
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+NHANES <- NHANES %>%
+  mutate(Tri_Adj = Triclosan / Creatinine, BPA_Adj = BPA / Creatinine)
+```
+
+**For both triclosan and BPA, create a categorical variable with 4 levels such that:**  
+
+Q1 = below LOD  
+Q2-Q4:  tertiles of detectable levels of triclosan  
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+#Triclosan
+NHANES_sub <- NHANES %>% 
+  filter(TriComment == "Above_LOD")
+
+NHANES.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_sub)
+
+svyquantile(~Tri_Adj, NHANES.svy, c( 0.33, 0.66),ci=F)
+  #Cutpoints are 0.09034676 and 0.4498739
+
+NHANES <- NHANES %>% 
+  mutate(TriTert = if_else(TriComment == "Below_LOD", "Q1", 
+                           if_else(Tri_Adj < 0.09034676 & TriComment == "Above_LOD", "Q2", 
+                                   if_else(Tri_Adj >= 0.09034676 & Tri_Adj < 0.4498739 & TriComment == "Above_LOD", "Q3", 
+                                           if_else(Tri_Adj >= 0.4498739 & TriComment == "Above_LOD", "Q4", NA_character_)))))
+
+#BPA
+NHANES_sub1 <- NHANES %>% 
+  filter(BPAComment == "Above_LOD")
+
+NHANES.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_sub1)
+
+svyquantile(~BPA_Adj, NHANES.svy, c( 0.33, 0.66),ci=F)
+  #Cutpoints are 0.01941748 and 0.03571429
+
+NHANES <- NHANES %>% 
+  mutate(BPATert = if_else(BPAComment == "Below_LOD", "Q1", 
+                           if_else(BPA_Adj < 0.01941748 & BPAComment == "Above_LOD", "Q2", 
+                                   if_else(BPA_Adj >= 0.01941748 & BPA_Adj < 0.03571429 & BPAComment == "Above_LOD", "Q3", 
+                                           if_else(BPA_Adj >= 0.03571429 & BPAComment == "Above_LOD", "Q4", NA_character_)))))
+
+NHANES.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES)
+```
+
+**For both triclosan and BPA, create a categorical variable with 2 levels such that:**  
+
+Q1 = below LOD  
+Q2 = above LOD
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+#This already exists. TriComment and BPAComment
+```
+
+**Create additional categorical variables as described in Table 1**  
+
+* You will need to recode race/ethnicity    
+* Make sure the value that is the reference is coded with the lowest number (e.g., males = 0 and females = 1, etc.)    
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+NHANES <- NHANES %>%
+  mutate(BMI_Class = if_else(BMI <18.5, "Underweight", 
+                            if_else(BMI >= 18.5 & BMI <25, "Normal", 
+                                    if_else(BMI >= 25 & BMI <30, "Overweight", 
+                                            if_else(BMI >= 30, "Obese", NA_character_)))))
+
+NHANES <- NHANES %>%
+  mutate(Cot_Class = if_else(Cotinine < 0.015, "Below_LOD", 
+                             if_else(Cotinine >= 0.015 & Cotinine <= 12, "Medium", 
+                                     if_else(Cotinine > 12, "High", NA_character_)))) 
+
+NHANES <- NHANES %>%
+  mutate(SES = if_else(PovertyRatio <= 2, "Low", 
+                       if_else(PovertyRatio > 2 & PovertyRatio < 5, "Medium", 
+                               if_else(PovertyRatio >= 5, "High", NA_character_))))
+
+NHANES <- NHANES %>%
+  mutate(Race_Eth = if_else(Race == "Mexican" | Race == "Other Hispanic", "Hispanic", 
+                            if_else(Race == "NH_White", "NH_White", 
+                                    if_else(Race == "NH_Black", "NH_Black", 
+                                            if_else(Race == "Other", "Other", NA_character_)))))
+
+NHANES.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES)
+
+```
+
+## Step 3:  Complete the 3 tables 
+**Note:** Don’t forget to set survey design!
+
+### Table 1
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+#Filling out the table
+NHANES %>% 
+  count(Gender)  
+NHANES %>% 
+  count(Race_Eth)  
+NHANES %>% 
+  count(SES)  
+NHANES %>% 
+  count(Cot_Class)  
+NHANES %>% 
+  count(TriTert)  
+NHANES %>% 
+  count(BPATert) 
+NHANES %>% 
+  count(BMI_Class)  
+
+NHANES.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES)
+
+svymean(~Gender, NHANES.svy)
+svymean(~Race_Eth, NHANES.svy)
+svymean(~SES, NHANES.svy)
+svymean(~Cot_Class, NHANES.svy)
+svymean(~TriTert, NHANES.svy)
+svymean(~BPATert, NHANES.svy)
+svymean(~BMI_Class, NHANES.svy)
+
+# Paste Table 1 here
+knitr::include_graphics("Table1.png")
+```
+
+### Table 2
+**Note: treat BMI as a continuous variable, use linear regression, be sure to use indicator variables where necessary**
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+#Gender
+NHANES_dum <- dummy_cols(NHANES, select_columns = "Gender")
+
+NHANES_dum.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_dum)
+
+GenBMI <- svyglm(log(BMI)~Gender_Female, family=gaussian, design=NHANES_dum.svy)
+summ(GenBMI)
+
+#Race
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "Race_Eth")
+
+NHANES_dum.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_dum)
+
+RaceBMI <- svyglm(log(BMI)~Race_Eth_NH_Black+Race_Eth_Other+Race_Eth_Hispanic, family=gaussian, design=NHANES_dum.svy)
+summ(RaceBMI)
+
+#SES
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "SES")
+
+NHANES_dum.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_dum)
+
+SESBMI <- svyglm(log(BMI)~SES_Medium+SES_High, family=gaussian, design=NHANES_dum.svy)
+summ(SESBMI)
+
+#Cotinine
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "Cot_Class")
+
+NHANES_dum.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_dum)
+
+CotBMI <- svyglm(log(BMI)~Cot_Class_Medium+Cot_Class_High, family=gaussian, design=NHANES_dum.svy)
+summ(CotBMI)
+
+#Triclosan
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "TriTert")
+
+NHANES_dum.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_dum)
+
+TriBMI <- svyglm(log(BMI)~TriTert_Q2+TriTert_Q3+TriTert_Q4, family=gaussian, design=NHANES_dum.svy)
+summ(TriBMI)
+
+#BPA
+NHANES_dum <- dummy_cols(NHANES, select_columns = "BPATert")
+
+NHANES_dum.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_dum)
+
+BPABMI <- svyglm(log(BMI)~BPATert_Q2+BPATert_Q3+BPATert_Q4, family=gaussian, design=NHANES_dum.svy)
+summ(BPABMI)
+
+# Paste Table 2 here
+knitr::include_graphics("Table2.png")
+```
+
+### Table 3
+**To complete this table, you will need to run 3 models:**  
+* Triclosan in 4 categories (a)  
+* Triclosan categories as a continuous variable (b)  
+* Triclosan in 2 categories (c)  
+
+**In each of the models, adjust for the following covariates:**   
+* age (continuous)  
+* race (using the categories in Table 2)  
+* socioeconomic status (using PIR categories in Table 2)   
+* cotinine (using categories in Table 2)  
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+#A
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "Race_Eth")
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "SES")
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "Cot_Class")
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "TriTert")
+
+NHANES_dum.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_dum)
+
+TriBMI_Full <- svyglm(log(BMI)~TriTert_Q2+TriTert_Q3+TriTert_Q4+Age+Race_Eth_NH_Black+Race_Eth_Other+Race_Eth_Hispanic+SES_Medium+SES_High+Cot_Class_Medium+Cot_Class_High, family=gaussian, design=NHANES_dum.svy)
+summ(TriBMI_Full)
+
+#B
+svyhist(~Triclosan, NHANES.svy, main="Survey weighted Triclosan",col="blue")
+svyhist(~log(Triclosan), NHANES.svy, main="Survey weighted Triclosan",col="blue")
+
+TriBMIModel<-svyglm(log(BMI)~log(Tri_Adj)+Age+Race_Eth_NH_Black+Race_Eth_Other+Race_Eth_Hispanic+SES_Medium+SES_High+Cot_Class_Medium+Cot_Class_High,NHANES_dum.svy)
+summary(TriBMIModel)
+
+#C
+NHANES_dum <- dummy_cols(NHANES_dum, select_columns = "TriComment")
+NHANES_dum.svy <- svydesign(ids=~SampUnit,strata=~Strata,weights=~Weight,nest=T,data=NHANES_dum)
+
+TriBMIModel<-svyglm(log(BMI)~TriComment_Above_LOD+Age+Race_Eth_NH_Black+Race_Eth_Other+Race_Eth_Hispanic+SES_Medium+SES_High+Cot_Class_Medium+Cot_Class_High,NHANES_dum.svy)
+summary(TriBMIModel)
+
+# Paste Table 3 here
+knitr::include_graphics("Table3.png")
+```
+
+## Step 4:  Graphic representation of results
+Make a graph that summarizes your results (whatever format you like; be sure to label all axes).
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+BMI_Terts <- ggplot(data = NHANES_dum, aes(x=TriTert, y=BMI)) +
+  geom_bar(stat = "summary", fun.y = "mean") +
+  ggtitle("BMI by Triclosan Quartiles") +
+  ylab("Average BMI") +
+  xlab("Triclosan Quartiles") +
+  coord_cartesian(ylim = c(25, 27.5)) +
+  stat_summary(geom = "errorbar", fun.data = mean_se, position = "dodge") + theme_nice()
+BMI_Terts
+
+BMI_Bin <- ggplot(data = NHANES_dum, aes(x=fct_rev(fct_infreq(TriComment)), y=BMI)) +
+  geom_bar(stat = "summary", fun.y = "mean") +
+  ggtitle("Triclosan Reading vs Average BMI") +
+  ylab("Average BMI") +
+  xlab("Triclosan Reading") + 
+  geom_smooth(method = "lm") +
+  coord_cartesian(ylim = c(25, 27)) +
+  stat_summary(geom = "errorbar", fun.data = mean_se, position = "dodge") +  theme_nice()
+BMI_Bin
+
+BMIPoint <- ggplot(data=NHANES_dum, aes(x=Tri_Adj, y=BMI)) +
+  geom_point(alpha=.2) +
+  geom_smooth(method = lm, se = TRUE) + 
+  ggtitle("Triclosan vs BMI") +
+  ylab("Average BMI") +
+  xlab("Triclosan (adjusted)") + theme_nice()
+BMIPoint
+
+```
+
+## Step 5: Interpretation
+Describe your results using the guidelines below (please be as concise as possible using complete sentences rather than bullets or fragments, etc.)
+
+### Hypothesis:  
+**Triclosan exposure is associated with an increase in BMI. **
+
+### Sample:  
+**Data was taken from the 2003-2004 NHANES database. The original dataset included 10122 observations. Observations missing any variable were excluded, leaving a final sample size of 2215. **
+
+### Statistical Methods:  
+**Seperate general linear models were run using the survey design to test the association between Sex, Race/Ethnicity, SES, Cotinine, Triclosan, and BPA on BMI. Seperate survey weighted models were then run to assess the association between Triclosan exposure (measure in quartiles, a continuous variable, and then as a binary variable based on detection limit) using Sex, Race/Ethnicity, SES, Cotinine, and BPA as covariates. **
+
+### Results:
+**When subjects are split into two groups based on whether their Triclosan levels are above or below the Limit of Detection, Triclosan exposure is associated with significantly higher BMI (Beta = 0.042206, p = 0.01321). When Triclosan exposure is split into four quartiles, Low and Medium Triclosan exposure are associated with significant increases in BMI (Beta = 0.06, p = 0.03 and Beta = 0.04, p = 0.04 respectively). However, High Triclosan exposure is not associated with a significant change in BMI (p = 0.07). Since the largest effect is seen in Low exposures, and no significant effect is seen at high exposures, there is not evidence of a dose-repsonse effect. When Triclosan exposure and BMI are both interpreted as continuous variables, no significant association is found between the two (p = 0.309). **
+
